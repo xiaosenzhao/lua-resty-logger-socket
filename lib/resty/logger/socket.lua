@@ -14,9 +14,8 @@ local debug                 = ngx.config.debug
 
 local DEBUG                 = ngx.DEBUG
 local CRIT                  = ngx.CRIT
-
+local ALERT                 = ngx.ALERT
 local MAX_PORT              = 65535
-
 
 -- table.new(narr, nrec)
 local succ, new_tab = pcall(require, "table.new")
@@ -58,7 +57,9 @@ local max_buffer_reuse      = 10000        -- reuse buffer for at most 10000
                                            -- times
 local periodic_flush        = nil
 local need_periodic_flush   = nil
-local sock_type             = 'tcp'
+local sock_type             = 'udp'
+local sock
+local err
 
 -- internal variables
 local buffer_size           = 0
@@ -83,13 +84,15 @@ local flushing
 local logger_initted
 local counter               = 0
 local ssl_session
+local queue = {first = 0, last = -1}
 
 local function _write_error(msg)
     last_error = msg
 end
 
 local function _do_connect()
-    local ok, err, sock
+    -- local ok, err, sock
+    local ok
 
     if not connected then
         if (sock_type == 'udp') then
@@ -140,7 +143,7 @@ local function _do_handshake(sock)
 end
 
 local function _connect()
-    local err, sock
+    -- local err, sock
 
     if connecting then
         if debug then
@@ -149,7 +152,7 @@ local function _connect()
         return nil, "previous connection not finished"
     end
 
-    connected = false
+    -- connected = false
     connecting = true
 
     retry_connect = 0
@@ -361,14 +364,68 @@ local function _flush_buffer()
     end
 end
 
-local function _write_buffer(msg, len)
+local function _write_buffer(msg)
     log_buffer_index = log_buffer_index + 1
     log_buffer_data[log_buffer_index] = msg
 
-    buffer_size = buffer_size + len
+    buffer_size = buffer_size + #msg
 
 
     return buffer_size
+end
+
+local function _pushright(queue, value)
+    if queue.last - queue.first <= 1000 then
+        local last = queue.last + 1
+        queue.last = last
+        queue[last] = value
+    end
+end
+
+function _M._popleft(queue)
+    local first = queue.first
+    if first > queue.last then
+        return
+    end
+    local value = queue[first]
+    queue[first] = nil
+    queue.first = first + 1
+    return value
+end
+
+function _M.write_buffer(msg)
+    _pushright(queue, msg)
+end
+
+local function asyflush()
+    while true do
+        if is_exiting() then
+            return
+        end
+        local value = _M._popleft(queue)
+        local sock, err, bytes, ok
+        if value then
+            sock, err = _connect()
+            if sock then
+                bytes, err = sock:send(value)
+                if bytes then
+                    if debug then
+                        ngx.update_time()
+                        ngx_log(DEBUG, ngx.now(), ":log flush:" .. bytes .. ":" .. value)
+                    end
+
+                    if (sock_type ~= 'udp') then
+                        ok, err = sock:setkeepalive(0, pool_size)
+                    end
+                end
+                if err then
+                    connected = false
+                end
+            end
+        else
+            ngx.sleep(0.1)
+        end
+    end
 end
 
 function _M.init(user_config)
@@ -490,7 +547,7 @@ function _M.init(user_config)
         need_periodic_flush = true
         timer_at(periodic_flush, _periodic_flush)
     end
-
+    ngx.thread.spawn(asyflush)
     return logger_initted
 end
 
@@ -505,36 +562,45 @@ function _M.log(msg)
         msg = tostring(msg)
     end
 
-    local msg_len = #msg
-
     if (debug) then
         ngx.update_time()
-        ngx_log(DEBUG, ngx.now(), ":log message length: " .. msg_len)
+        ngx_log(DEBUG, ngx.now(), ":log message length: " .. #msg)
     end
+
+    local msg_len = #msg
 
     -- response of "_flush_buffer" is not checked, because it writes
     -- error buffer
     if (is_exiting()) then
         exiting = true
-        _write_buffer(msg, msg_len)
+        _write_buffer(msg)
         _flush_buffer()
         if (debug) then
             ngx_log(DEBUG, "Nginx worker is exiting")
         end
         bytes = 0
+    elseif msg_len <= drop_limit then
+        _M.write_buffer(msg)
+    else
+        -- ngx_log(ALERT, "the length of this message is bigger than 64k, this log message will be dropped", msg)
+        local shortmsg = string.sub(msg, 1, 64512)
+        _M.write_buffer(shortmsg)
+    end
+    return msg_len
+    --[[
     elseif (msg_len + buffer_size < flush_limit) then
-        _write_buffer(msg, msg_len)
+        _write_buffer(msg)
         bytes = msg_len
     elseif (msg_len + buffer_size <= drop_limit) then
-        _write_buffer(msg, msg_len)
+        _write_buffer(msg)
         _flush_buffer()
         bytes = msg_len
     else
         _flush_buffer()
-        if (debug) then
-            ngx_log(DEBUG, "logger buffer is full, this log message will be "
+        -- if (debug) then
+        ngx_log(ALERT, "logger buffer is full, this log message will be "
                     .. "dropped")
-        end
+        -- end
         bytes = 0
         --- this log message doesn't fit in buffer, drop it
     end
@@ -546,7 +612,9 @@ function _M.log(msg)
     end
 
     return bytes
+    ]]--
 end
+
 
 function _M.initted()
     return logger_initted
